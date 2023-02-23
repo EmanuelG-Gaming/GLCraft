@@ -9,18 +9,20 @@ uniform sampler2D theTexture;
 uniform vec3 lightPosition;
 
 const vec4 fogColor = vec4(0.47, 0.57, 0.97, 1.0);
-const float fogIntensity = 0.0007;
+const float fogIntensity = 0.0003;
 
 
 void main()
 {
      float intensity = 0.9;
-     float atlasSize = 4.0;
+     float atlasWidth = 16.0;
+     
      vec2 texCoord;
+     // If normal is vertical
      if (normal.y != 0.0) {
-         texCoord = vec2((fract(mCoord.x) + mCoord.w) / atlasSize, mCoord.z);
+         texCoord = vec2((fract(mCoord.x) + mCoord.w) / atlasWidth, mCoord.z);
      } else {
-         texCoord = vec2((fract(mCoord.x + mCoord.z) + mCoord.w) / atlasSize, -mCoord.y);
+         texCoord = vec2((fract(mCoord.x + mCoord.z) + mCoord.w) / atlasWidth, -mCoord.y);
      }
      
      vec4 color = texture2D(theTexture, texCoord);
