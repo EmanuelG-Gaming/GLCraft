@@ -1484,7 +1484,7 @@ class Ray {
                 }
                 
                 if (placing) {
-                    // Redo the step calculations, now returning the intersection, instead of extending the ray
+                    // Redo the step calculations, now returning the intersection with a ray that is a full step further
                     if (lengths.x < lengths.y && lengths.x < lengths.z) {
                         if (level->get_type(voxelCheck.x, voxelCheck.y, voxelCheck.z) == BlockTypes::air &&
                             level->get_type(voxelCheck.x + step.x, voxelCheck.y, voxelCheck.z) != BlockTypes::air) {
