@@ -23,12 +23,16 @@
 #define COMBINED_SIZE (CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH)
 #define VBO_SIZE (COLLECTION_WIDTH * COLLECTION_HEIGHT * COLLECTION_DEPTH)
 
-const int SCREEN_WIDTH = 640;
-const int SCREEN_HEIGHT = 480;
+#define SCREEN_WIDTH 640
+#define SCREEN_HEIGHT 480
+
+#define SHADOW_WIDTH 1024
+#define SHADOW_HEIGHT 1024
+
 SDL_Window *windows;
 
 static const int transparency[16] = { 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 4, 0 };
-// Notice how a block's type might be different from the vertices it has
+// Notice how a block's type might be different from the vertice types it has
 enum class BlockTypes : uint8_t {
     air = 0,
     grass = 1,
@@ -113,6 +117,22 @@ struct Vec3f {
     void norm() {
         multiply(1 / len());
     }
+    Vec3f add(Vec3f other) {
+        Vec3f result;
+        result.x = x + other.x;
+        result.y = y + other.y;
+        result.z = z + other.z;
+        
+        return result;
+    }
+    Vec3f mul(float scalar) {
+        Vec3f result;
+        result.x = x * scalar;
+        result.y = y * scalar;
+        result.z = z * scalar;
+        
+        return result;
+    }
 };
 
 struct Vec4f {
@@ -161,7 +181,18 @@ class Mat4x4 {
            values[M23] = -1.0f;            
            values[M33] = 0.0f;
        }
-       void set_look_at(Vec3f cameraPosition, Vec3f lookingAt, Vec3f up) {
+       void set_orthographic(float left, float right, float bottom, float top, float near, float far) {
+           identity();
+           
+           values[M00] = 2.0f / (right - left);
+           values[M11] = 2.0f / (top - bottom);
+           values[M22] = -2.0f / (far - near);
+           
+           values[M30] = -(right + left) / (right - left);
+           values[M31] = -(top + bottom) / (top - bottom);
+           values[M32] = -(far + near) / (far - near);
+       }
+       void set_look_at(Vec3f &cameraPosition, Vec3f &lookingAt, Vec3f &up) {
            Vec3f fwd = { cameraPosition.x - lookingAt.x,
                           cameraPosition.y - lookingAt.y,
                           cameraPosition.z - lookingAt.z };
@@ -192,6 +223,17 @@ class Mat4x4 {
            
        }
        
+       void set_bias(float bias) {
+           identity();
+           
+           values[M00] = bias;
+           values[M11] = bias;
+           values[M22] = bias;
+           
+           values[M30] = bias;
+           values[M31] = bias;
+           values[M32] = bias;
+       }
        
        void set_translation(float x, float y, float z) {
            identity();
@@ -301,6 +343,7 @@ namespace Projection {
         zFar = 1000.0f;
         aspectRatio = float(SCREEN_WIDTH) / float(SCREEN_HEIGHT);
         projMat.set_perspective(fov, zNear, zFar, aspectRatio);
+        //projMat.set_orthographic(-15.0f, 15.0f, -15.0f, 15.0f, 0.01f, 75.0f);
     }
 };
 
@@ -458,7 +501,9 @@ void Shaders::load() {
        
     s("testShader", "testShader.vert", "testShader.frag");
     s("overlayShader", "overlayShader.vert", "overlayShader.frag");
-    s("uiShader", "uiShader.vert", "uiShader.frag");	
+    s("uiShader", "uiShader.vert", "uiShader.frag");
+    s("lightShader", "lightShader.vert", "lightShader.frag");
+    s("colorShader", "colorShader.vert", "colorShader.frag");	
 };
 
 void Shaders::clear() {
@@ -483,6 +528,7 @@ class Texture {
        
        void load() {
            if (!loaded) {
+               glActiveTexture(GL_TEXTURE0);
                glGenTextures(1, &this->textureIndex);
                glBindTexture(GL_TEXTURE_2D, this->textureIndex);
                
@@ -501,7 +547,6 @@ class Texture {
                } else {
                    printf("Counldn't generate texture!\n");
                }
-               SDL_FreeSurface(this->texture);
                
                this->loaded = true;
                printf("Loaded texture.\n");
@@ -513,6 +558,7 @@ class Texture {
        }
        void clear() {
            glDeleteTextures(1, &this->textureIndex);
+           SDL_FreeSurface(this->texture);
        }
     protected:
        const char *fileName;
@@ -573,12 +619,27 @@ struct AABB {
         
         return result;
     }
+    
+    Vec3f get_size() {
+        Vec3f result;
+        result.x = max.x - min.x;
+        result.y = max.y - min.y;
+        result.z = max.z - min.z;
+        
+        return result;
+    }
 };
-
+/*
+struct BlockData {
+    BlockTypes type;
+    //SDL_Color averageColor;
+};
+*/
 struct Block {
-    // The position relative to this chunk's position in 8 bits (-256 <= value <= 256)
+    // The position relative to this chunk's position in 8 bits per coordinate (-256 <= value <= 256)
     Vec3b position;
     BlockTypes type;
+    //BlockData data;
     
     Block() {}
     Block(uint8_t x, uint8_t y, uint8_t z, BlockTypes type) : position(x, y, z), type(type) {}
@@ -594,7 +655,7 @@ struct Block {
 
 // Perlin noise utilities
 namespace Perlin {
-    uint8_t perms[256];
+    uint8_t perms[256 * 2];
     float interp_1D(float value1, float value2, float alpha) {
          //return (value2 - value1) * alpha + value1;
          return (value2 - value1) * alpha + value1;
@@ -617,12 +678,16 @@ namespace Perlin {
          }
          
          // Shuffle element indices
-         for (int i = 255; i > 0; i--) {
-              int index = rand() % 255;
+         for (int i = 256 - 1; i > 0; i--) {
+              int index = rand() % (256 - 1);
               uint8_t temporary = perms[i];
               
               perms[i] = perms[index];
               perms[index] = temporary;
+         }
+         
+         for (int i = 0; i < 256; i++) {
+              perms[i + 256 - 1] = perms[i];
          }
     }
     
@@ -642,8 +707,8 @@ namespace Perlin {
     } 
     
     float noise(float nx, float ny) {
-         int x = (int)floor(nx);
-         int y = (int)floor(ny);
+         uint8_t x = (uint8_t)floor(nx) & 255;
+         uint8_t y = (uint8_t)floor(ny) & 255;
          int px = x + 1;
          int py = y + 1;
          
@@ -669,10 +734,128 @@ namespace Perlin {
          float fy = fade(dy);
          
          float value = 0.0f;
-         value = interp_1D(fx, interp_1D(fy, dot4, dot2), interp_1D(fx, dot3, dot1));
+         value = interp_1D(interp_1D(dot4, dot2, fy), interp_1D(dot3, dot1, fy), fx);
          return value;
     }
 };
+
+struct MeshVertex {
+    Vec3f Position;
+    Vec2f TextureCoordinates;
+    Vec3f Color;
+    
+    MeshVertex() {}
+    MeshVertex(Vec3f pos, Vec2f texCoords) : Position(pos), TextureCoordinates(texCoords) {}
+};
+
+struct BatchType {
+    GLenum renderType;
+    Mat4x4 model;
+    Texture *texture;
+};
+
+// Example batch class
+class Batch {
+    public:
+       Batch(int capacity) {
+           this->vertexCapacity = capacity;
+           this->verticesUsed = 0;
+           this->vertexVBO = 0;
+           
+           this->type.renderType = GL_TRIANGLES;
+           this->type.texture = new Texture("stone-fragment.png");
+           this->type.texture->load();
+           
+           setup();
+       }
+       
+       void setup() {
+           glGenBuffers(1, &this->vertexVBO);
+
+           glBindBuffer(GL_ARRAY_BUFFER, this->vertexVBO);
+           glBufferData(GL_ARRAY_BUFFER, this->vertexCapacity * sizeof(MeshVertex), nullptr, GL_STREAM_DRAW); 
+
+           glBindBuffer(GL_ARRAY_BUFFER, 0);
+       }
+       
+       void add(std::vector<MeshVertex> vertices) {
+           int extra = this->get_extra_vertices();
+           if (vertices.size() + extra > vertexCapacity - verticesUsed) {
+               return;
+           }
+           if (vertices.empty()) {
+               return;
+           }
+           if (vertices.size() > vertexCapacity) {
+               return;
+           }
+           
+           glBindBuffer(GL_ARRAY_BUFFER, this->vertexVBO);
+           if (extra > 0) {
+               glBufferSubData(GL_ARRAY_BUFFER, (verticesUsed + 0) * sizeof(MeshVertex), sizeof(MeshVertex), &lastUsed);
+               glBufferSubData(GL_ARRAY_BUFFER, (verticesUsed + 1) * sizeof(MeshVertex), sizeof(MeshVertex), &vertices[0]);
+           }
+           glBufferSubData(GL_ARRAY_BUFFER, verticesUsed * sizeof(MeshVertex), vertices.size() * sizeof(MeshVertex), &vertices[0]);
+            
+           glBindBuffer(GL_ARRAY_BUFFER, 0);
+           verticesUsed += vertices.size() + extra;
+           lastUsed = vertices.back();
+       }
+       
+       void render(Shader *shader) {
+           if (verticesUsed == 0) {
+               return;
+           }
+           shader->use();
+           this->type.texture->draw();
+           
+           GLint position = shader->attribute_location("position");
+           GLint color = shader->attribute_location("color");
+           GLint texCoord = shader->attribute_location("textureCoords");
+           
+           shader->set_uniform_mat4("model", this->type.model);
+           shader->set_uniform_mat4("view", Projection::viewMat);
+           shader->set_uniform_mat4("projection", Projection::projMat);
+           
+           glBindBuffer(GL_ARRAY_BUFFER, this->vertexVBO);
+           glVertexAttribPointer(position, 3, GL_FLOAT, GL_FALSE, sizeof(MeshVertex), (void*) offsetof(MeshVertex, Position));
+           glEnableVertexAttribArray(position);
+           
+           glVertexAttribPointer(color, 3, GL_FLOAT, GL_FALSE, sizeof(MeshVertex), (void*) offsetof(MeshVertex, Color));
+           glEnableVertexAttribArray(color);
+           
+           glVertexAttribPointer(texCoord, 2, GL_FLOAT, GL_FALSE, sizeof(MeshVertex), (void*) offsetof(MeshVertex, TextureCoordinates));
+           glEnableVertexAttribArray(texCoord);
+           
+           glDrawArrays(this->type.renderType, 0, verticesUsed);
+           
+           glDisableVertexAttribArray(position);
+           glDisableVertexAttribArray(color);
+           glDisableVertexAttribArray(texCoord);
+           glBindBuffer(GL_ARRAY_BUFFER, 0);
+           glBindTexture(GL_TEXTURE_2D, 0);
+           
+           this->verticesUsed = 0;
+       }
+       int get_extra_vertices() {
+           bool mode = (this->type.renderType == GL_TRIANGLE_STRIP && verticesUsed > 0);
+           return mode ? 2 : 0;
+       }
+       void dispose() {
+           if (this->vertexVBO) {
+               glDeleteBuffers(1, &this->vertexVBO);
+           }
+       }
+    protected:
+       int vertexCapacity;
+       int verticesUsed;
+       MeshVertex lastUsed;
+       
+       GLuint vertexVBO;
+       BatchType type;
+};
+
+
 
 static struct Chunk *chunk_VBOs[VBO_SIZE] = {0};
 static int now;
@@ -729,6 +912,7 @@ struct Chunk {
         // If inside the chunk, just return the block normally
         return this->blocks[x][y][z];
     }
+    
     BlockTypes get_type(int x, int y, int z) {
         if (x < 0) return this->left ? this->left->blocks[x + CHUNK_WIDTH][y][z].type : BlockTypes::air;
         if (x >= CHUNK_WIDTH) return this->right ? this->right->blocks[x - CHUNK_WIDTH][y][z].type : BlockTypes::air;
@@ -838,7 +1022,7 @@ struct Chunk {
     }
     
     float perlin_2D(float x, float y, float scale, float magnitude) {
-        float s = float(Perlin::noise(x / scale, y / scale) * magnitude);
+        float s = float(Perlin::noise(x * scale, y * scale) * magnitude);
         
         return s;
     }
@@ -846,7 +1030,7 @@ struct Chunk {
         float sum = 0.0f, stregth = 1.0f, scale = 1.0f;
         
         for (int i = 0; i < octaves; i++) {
-             sum += stregth * Perlin::noise(x / scale, y / scale);
+             sum += stregth * Perlin::noise(x * scale, y * scale);
              scale *= 2.0f;
              stregth *= persistence;
         }
@@ -863,7 +1047,7 @@ struct Chunk {
         
         for (int x = 0; x < CHUNK_WIDTH; x++) {
             for (int z = 0; z < CHUNK_DEPTH; z++) {
-                 float m = this->perlin_2D((x + position.x * CHUNK_WIDTH + COLLECTION_WIDTH * CHUNK_WIDTH / 2) / 30.0, (z + position.z * CHUNK_DEPTH + COLLECTION_DEPTH * CHUNK_DEPTH / 2) / 30.0, 4, 0.8) * 2;
+                 float m = this->perlin_2D((x + position.x * CHUNK_WIDTH + COLLECTION_WIDTH * CHUNK_WIDTH / 2) / 200.0f, (z + position.z * CHUNK_DEPTH + COLLECTION_DEPTH * CHUNK_DEPTH / 2) / 200.0f, 5, 0.55f) * 8;
                  uint8_t h = m * 2;
                  
                  
@@ -873,20 +1057,31 @@ struct Chunk {
                          this->set_block_gen(x, y - 1, z, BlockTypes::dirt);  
                      }
                  }
+                 
+                 
                  /*
                  for (int y = 0; y < CHUNK_HEIGHT; y++) {
                      if (y + position.y * CHUNK_HEIGHT < 2) {
                          if (this->get_type(x, y, z) == BlockTypes::air) {
+                             // Water
                              this->set_block_gen(x, y, z, BlockTypes::water);
                          }
                      }
                  }
                  */
                  
+                 float stone = this->perlin_2D((x + position.x * CHUNK_WIDTH + COLLECTION_WIDTH * CHUNK_WIDTH / 2) / 128.0f, (z + position.z * CHUNK_DEPTH + COLLECTION_DEPTH * CHUNK_DEPTH / 2) / 128.0f, 4, 0.5f) * 2;
                  for (int y = 0; y < CHUNK_HEIGHT; y++) {
                      if (y + position.y * CHUNK_HEIGHT < -5) {
                          // Stone layer
                          this->set_block_gen(x, y, z, BlockTypes::stone);
+                     } else {
+                         if (stone >= 1.0f) {
+                             BlockTypes b = this->get_type(x, y, z);
+                             if (b == BlockTypes::dirt && y > 4) {
+                                 this->set_block_gen(x, y, z, BlockTypes::stone);
+                             }
+                         }
                      }
                  }
                  
@@ -894,11 +1089,12 @@ struct Chunk {
                  if (b == BlockTypes::dirt || b == BlockTypes::grass) {
                      // A layer of grass blocks on top of the dirt blocks
                      this->set_block_gen(x, h, z, BlockTypes::grass);
-                      
+                     
                      // Trees
                      if (rand() % 300 == 1) {
                          this->tree(x, z, h);
                      }
+                     
                  }
             }
         }
@@ -931,8 +1127,6 @@ struct Chunk {
              }
         }
     }
-    
-    
     
     void update() {
         bool visible = false;        
@@ -1179,7 +1373,7 @@ struct Chunk {
         glBufferData(GL_ARRAY_BUFFER, i * sizeof *vertices, vertices, GL_STATIC_DRAW);
     }
     
-    void render() {
+    void render(GLint &attributePosition) {
         if (this->changed) {
             this->update();
         }
@@ -1187,20 +1381,13 @@ struct Chunk {
         
         if (!this->elementCount) return;
         
-        Shaders::get().use("testShader");
-        
-        Shaders::get().find("testShader")->set_uniform_mat4("view", Projection::viewMat);
-        Shaders::get().find("testShader")->set_uniform_mat4("projection", Projection::projMat);
-        
-        GLint position = Shaders::get().find("testShader")->attribute_location("position");
-         
         glBindBuffer(GL_ARRAY_BUFFER, this->vboVertices);
-        glVertexAttribPointer(position, 4, GL_BYTE, GL_FALSE, 0, 0);
-        glEnableVertexAttribArray(position);
+        glVertexAttribPointer(attributePosition, 4, GL_BYTE, GL_FALSE, 0, 0);
+        glEnableVertexAttribArray(attributePosition);
         
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei) this->elementCount);
            
-        glDisableVertexAttribArray(position);     
+        glDisableVertexAttribArray(attributePosition);     
     }
 };
 
@@ -1252,6 +1439,7 @@ struct ChunkCollection {
         }
         
         this->blockTexture->load();
+        Shaders::get().find("testShader")->set_uniform_int("theTexture", 0);
     };
     
     BlockTypes get_type(int x, int y, int z) {
@@ -1261,7 +1449,7 @@ struct ChunkCollection {
         
         if (mx < 0 || mx >= COLLECTION_WIDTH ||
             my < 0 || my >= COLLECTION_HEIGHT ||
-            mz < 0 || mz >= COLLECTION_DEPTH) return BlockTypes::air;
+            mz <= 0 || mz >= COLLECTION_DEPTH) return BlockTypes::air;
         
         return chunks[mx][my][mz]->get_type(
             x & (CHUNK_WIDTH - 1),
@@ -1276,7 +1464,7 @@ struct ChunkCollection {
         
         if (mx < 0 || mx >= COLLECTION_WIDTH ||
             my < 0 || my >= COLLECTION_HEIGHT ||
-            mz < 0 || mz >= COLLECTION_DEPTH) return Block();
+            mz <= 0 || mz >= COLLECTION_DEPTH) return Block();
         
         return chunks[mx][my][mz]->get_block(
             x & (CHUNK_WIDTH - 1),
@@ -1284,6 +1472,7 @@ struct ChunkCollection {
             z & (CHUNK_DEPTH - 1)   
         );
     }
+    
     void set_block(int x, int y, int z, BlockTypes type) {
         int mx = (x + CHUNK_WIDTH * (COLLECTION_WIDTH / 2)) / CHUNK_WIDTH;
         int my = (y + CHUNK_HEIGHT * (COLLECTION_HEIGHT / 2)) / CHUNK_HEIGHT;
@@ -1291,7 +1480,7 @@ struct ChunkCollection {
         
         if (mx < 0 || mx >= COLLECTION_WIDTH ||
             my < 0 || my >= COLLECTION_HEIGHT ||
-            mz < 0 || mz >= COLLECTION_DEPTH) return;
+            mz <= 0 || mz >= COLLECTION_DEPTH) return;
         
         chunks[mx][my][mz]->set_block(
             x & (CHUNK_WIDTH - 1),
@@ -1315,25 +1504,22 @@ struct ChunkCollection {
         return height;
     }
     
-    void render() {
-        Shaders::get().use("testShader");
-        
-        
+    void render(Mat4x4 &viewFrom, GLint &attributeCoord, bool light) {
         this->blockTexture->draw();
         
         float mDist = 1.0 / 0.0;
-        int mx = -1.0;
-        int my = -1.0;
-        int mz = -1.0;
+        int mx, my, mz;
+        mx = my = mz = -1;
+       
         for (int x = 0; x < COLLECTION_WIDTH; x++) {
             for (int y = 0; y < COLLECTION_HEIGHT; y++) {
                 for (int z = 0; z < COLLECTION_DEPTH; z++) {
                     Chunk *c = chunks[x][y][z];
                     if (c) {
-                        // The modelview matrix takes into account the camera's rotation
                         Mat4x4 model, modelView;
+                        
                         model.set_translation(c->position.x * CHUNK_WIDTH, c->position.y * CHUNK_HEIGHT, c->position.z * CHUNK_DEPTH);
-                        modelView = model.multiply(Projection::viewMat);
+                        modelView = model.multiply(viewFrom);
                         
                         Vec4f chunkCenter = { CHUNK_WIDTH / 2, CHUNK_HEIGHT / 2, CHUNK_DEPTH / 2, 1};
                         Vec4f pos = modelView.multiply_vector(chunkCenter);
@@ -1348,7 +1534,7 @@ struct ChunkCollection {
                         
                         if (fabsf(pos.x) > 1 + fabsf(CHUNK_HEIGHT * 2 / pos.w) ||
                             fabsf(pos.y) > 1 + fabsf(CHUNK_HEIGHT * 2 / pos.w)) continue;
-                            
+                         
                         
                         if (!c->initialized) {
                             if (mx < 0 || dst < mDist) {
@@ -1359,10 +1545,12 @@ struct ChunkCollection {
                             }
                             continue;
                         }
+                        if (light)
+                            Shaders::get().find("lightShader")->set_uniform_mat4("model", model);
+                        else
+                            Shaders::get().find("testShader")->set_uniform_mat4("model", model);
                         
-                        Shaders::get().find("testShader")->set_uniform_mat4("model", model);
-    
-                        c->render();
+                        c->render(attributeCoord);
                     }
                 }
             }
@@ -1483,8 +1671,9 @@ class Ray {
                     lengths.z += stepSize.z;
                 }
                 
+                // Are we placing blocks?
                 if (placing) {
-                    // Redo the step calculations, now tring to check intersection with a ray that is a full step further.
+                    // Redo the step calculations, now trying to check intersection with a ray that is a full step further.
                     if (lengths.x < lengths.y && lengths.x < lengths.z) {
                         if (level->get_type(voxelCheck.x, voxelCheck.y, voxelCheck.z) == BlockTypes::air &&
                             level->get_type(voxelCheck.x + step.x, voxelCheck.y, voxelCheck.z) != BlockTypes::air) {
@@ -1518,6 +1707,158 @@ class Ray {
        }
 };
 
+
+struct ParticleType {
+    Vec3f position;
+    Vec3f vel;
+    Vec3f velocitySpread;
+    float size;
+    
+    SDL_Color colorFrom, colorTo;
+    float duration = 1.0f;
+    std::vector<MeshVertex> vertices;
+};
+
+struct Particle {
+    bool active;
+    float timeTook;
+    float duration;
+    float size;
+    
+    Vec3f position;
+    Vec3f vel;
+    Vec3f acceleration;
+    SDL_Color colorFrom, colorTo;
+    
+    ParticleType *type;
+};
+
+class EffectProcessor {
+    public:
+       EffectProcessor() {
+           particleBatch = new Batch(2400);
+           instances.resize(800);
+           particleIndex = instances.size() - 1;
+       }
+       void emit(ParticleType *type);
+       void update(float timeTook);
+       float lerp(float value1, float value2, float alpha);
+       SDL_Color interp_color(SDL_Color colorFrom, SDL_Color colorTo, float alpha);
+       void render();
+       void dispose();
+    protected:
+       Batch *particleBatch;
+       std::vector<Particle> instances;
+       int particleIndex;
+};
+void EffectProcessor::emit(ParticleType *type) {
+    Particle& particle = this->instances[particleIndex];
+    particle.active = true;
+    particle.type = type;
+    
+    particle.duration = type->duration;
+    particle.timeTook = 0;
+    
+    particle.position = type->position;
+    
+    // Horizontal rotation
+    float theta = float(rand()) / float(RAND_MAX / (2 * M_PI));
+    // Vertical rotation
+    float phi = float(rand()) / float(RAND_MAX / (2 * M_PI));
+               
+    particle.vel.x = type->vel.x + cos(theta) * cos(phi) * type->velocitySpread.x;
+    particle.vel.y = type->vel.y + sin(phi) * type->velocitySpread.y;
+    particle.vel.z = type->vel.z + sin(theta) * cos(phi) * type->velocitySpread.z;
+    particle.size = 0.2f;
+    
+    particle.colorFrom = type->colorFrom;
+    particle.colorTo = type->colorTo;
+    
+    particleIndex = --particleIndex % instances.size();
+};
+float EffectProcessor::lerp(float value1, float value2, float alpha) {
+    return (value2 - value1) * alpha + value1;
+}
+SDL_Color EffectProcessor::interp_color(SDL_Color colorFrom, SDL_Color colorTo, float alpha) {
+    SDL_Color result;
+    
+    result.r = lerp(colorFrom.r, colorTo.r, alpha);
+    result.g = lerp(colorFrom.g, colorTo.g, alpha);
+    result.b = lerp(colorFrom.b, colorTo.b, alpha);
+    
+    return result;
+}     
+void EffectProcessor::update(float timeTook) {
+    for (auto &e : instances) {
+        if (!e.active) {
+            continue;
+        }
+        if (e.timeTook > e.duration) {
+            e.active = false;
+            continue;
+        }
+        
+        e.timeTook += timeTook;
+        
+        float resistance = 0.98f;
+        e.acceleration.x = -e.vel.x * resistance;
+        e.acceleration.y = -e.vel.y * resistance - 9.8f;
+        e.acceleration.z = -e.vel.z * resistance;
+        
+        e.vel.x += e.acceleration.x * timeTook;
+        e.vel.y += e.acceleration.y * timeTook;
+        e.vel.z += e.acceleration.z * timeTook;
+        
+        e.position.x += e.vel.x * timeTook;
+        e.position.y += e.vel.y * timeTook;
+        e.position.z += e.vel.z * timeTook;
+    }
+};
+void EffectProcessor::render() {
+    auto transform_vertices = [&](Particle &particle, std::vector<MeshVertex> &source) -> std::vector<MeshVertex> {
+        std::vector<MeshVertex> result;
+        // Linear interpolation
+        float alpha = particle.timeTook / particle.duration;
+        SDL_Color color = interp_color(particle.colorFrom, particle.colorTo, alpha);
+             
+        for (int i = 0; i < source.size(); i++) {
+             MeshVertex add;
+             Vec3f center = particle.position;
+             
+             Mat4x4 v = Projection::viewMat;
+             Vec3f right = { v.values[v.M00], v.values[v.M10], v.values[v.M20] };
+             Vec3f up = { v.values[v.M01], v.values[v.M11], v.values[v.M21] };
+             
+             Vec3f r = right.mul(source.at(i).Position.x);
+             Vec3f u = up.mul(source.at(i).Position.y);
+              
+             add.Position.x = center.x + r.x * particle.size + u.x * particle.size;
+             add.Position.y = center.y + r.y * particle.size + u.y * particle.size;
+             add.Position.z = center.z + r.z * particle.size + u.z * particle.size;
+             
+             add.TextureCoordinates.x = source.at(i).TextureCoordinates.x;
+             add.TextureCoordinates.y = source.at(i).TextureCoordinates.y;
+             
+             add.Color.x = color.r / 255.0f;
+             add.Color.y = color.g / 255.0f;
+             add.Color.z = color.b / 255.0f;
+             
+             result.push_back(add);
+        }
+        
+        return result;
+    };
+    for (auto &e : instances) {
+         if (!e.active) {
+             continue;
+         }
+         particleBatch->add(transform_vertices(e, e.type->vertices));
+    }
+    particleBatch->render(Shaders::get().find("colorShader"));
+};
+void EffectProcessor::dispose() {
+    particleBatch->dispose();
+};
 
 struct Player {
     Vec3f position;
@@ -1623,9 +1964,6 @@ struct Player {
         vel.y += acceleration.y * timeTook;
         vel.z += acceleration.z * timeTook;
         
-        // Damping
-        vel.x *= 0.85;
-        vel.z *= 0.85;
         
         position.x += vel.x * timeTook;
         position.y += vel.y * timeTook;
@@ -1639,8 +1977,10 @@ struct Player {
         }
         update_AABB();
         
+        // Damping
+        vel.x *= 0.85;
+        vel.z *= 0.85;
         
-
         Projection::cameraPosition.x = position.x;
         Projection::cameraPosition.y = position.y;
         Projection::cameraPosition.z = position.z;
@@ -1748,6 +2088,44 @@ struct Player {
                     position.z = front2.position.z + chunkPos.z - 1.0f;
                 }
             }
+        /*
+        for (int x = position.x - size.x; x < position.x + size.x; x++) {
+            for (int y = position.y - 1.5f; y < position.y + 0.5f; y++) {
+                for (int z = position.z - size.z; z < position.z + size.z; z++) {
+                    BlockTypes check = level->get_type(x, y, z);
+                    if (check != BlockTypes::air) {
+                        if (dirY > 0) {
+                            position.y = y - 0.5f;
+                            vel.y = 0;
+                        }
+                        else if (dirY < 0) {
+                            collidingGround = true;
+                            position.y = y + 1.5f + 1;
+                            vel.y = 0;
+                        }
+                        
+                        if (dirX > 0) {
+                            position.x = x - 0.5f;
+                            vel.x = 0;
+                        }
+                        else if (dirX < 0) {
+                            position.x = x + 0.5f + 1;
+                            vel.x = 0;
+                        }
+                        
+                        if (dirZ > 0) {
+                            position.z = z - 0.5f;
+                            vel.z = 0;
+                        }
+                        else if (dirZ < 0) {
+                            position.z = z + 0.5f + 1;
+                            vel.z = 0;
+                        }
+                    }
+                }
+            }
+        }
+        */
     }
     
     Chunk *chunk_on(int x, int y, int z) {
@@ -1757,7 +2135,7 @@ struct Player {
         
         if (px < 0 || px >= COLLECTION_WIDTH ||
             py < 0 || py >= COLLECTION_HEIGHT ||
-            pz < 0 || pz >= COLLECTION_DEPTH) return 0;
+            pz <= 0 || pz >= COLLECTION_DEPTH) return 0;
         
         return level->chunks[px][py][pz];
     }
@@ -2114,7 +2492,11 @@ namespace UI {
         AtlasButton *a = new AtlasButton("textures.png", get_index_from_type(type), type);
         a->select(s);
         
-        add(a, size * -1.0 / 20.0f + columns / 10.0f, -0.9f, 0.1f, 0.1f);
+        add(a, size * -1.0 / 20.0f + columns / 10.0f, -0.9f, 0.08f, 0.08f);
+    }
+    void add_frame(int columns, int size) {
+        Element *e = new Element("frame.png");
+        add(e, size * -1.0 / 20.0f + columns / 10.0f, -0.9f, 0.1f, 0.1f);
     }
     
     void load() {
@@ -2130,6 +2512,7 @@ namespace UI {
        };
        
        for (auto &m : types) {
+            add_frame(i, types.size());
             add_item(m, i, types.size());
             i++;
        }
@@ -2148,6 +2531,132 @@ namespace UI {
     }
 };
 
+class Renderer {
+    public:
+        Vec3f lightPos;
+        Vec3f sourceLightPos;
+        Vec3f lightLookPosition;
+        
+        static Renderer& get()
+        {
+            static Renderer ins;
+            return ins;
+        }
+        void load();
+        
+        void render();
+    private:
+        Renderer() {}
+        ~Renderer() {}
+    public:
+        Renderer(Renderer const&) = delete;
+        void operator = (Renderer const&) = delete;
+    protected:
+        GLuint FBO;
+        // AKA the shadowmap
+        GLuint depthTexture;
+        GLint lightPosition, cameraPosition;
+        int windowWidth, windowHeight;
+        int shadowSize;
+        
+        // The projection matrix of the light's view
+        Mat4x4 lightProj;
+        // Scale bias
+        Mat4x4 lightBias;
+};
+
+void Renderer::load() {
+    lightPosition = Shaders::get().find("lightShader")->attribute_location("position");
+    cameraPosition = Shaders::get().find("testShader")->attribute_location("position");
+    glEnableVertexAttribArray(lightPosition);
+    glEnableVertexAttribArray(cameraPosition);
+                                
+    SDL_GetWindowSize(windows, &this->windowWidth, &this->windowHeight);
+    
+    float cw = 40.0f;
+    float cd = 40.0f;
+    lightProj.set_orthographic(-cw, cd, -cw, cd, 1.0f, 1000.0f);
+    lightBias.set_bias(0.5f);
+    
+    // Load the depth texture
+    glActiveTexture(GL_TEXTURE1);
+    glGenTextures(1, &this->depthTexture);
+    glBindTexture(GL_TEXTURE_2D, this->depthTexture);
+    Shaders::get().find("testShader")->set_uniform_int("shadowmap", 1);
+    
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    
+    float color[] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, color);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, SHADOW_WIDTH, SHADOW_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+   
+    // Generate the frame buffer
+    glGenFramebuffers(1, &this->FBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, this->FBO);
+    
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, this->depthTexture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        printf("Couldn't complete the frame buffer!");
+    } else {
+        printf("Frame buffer complete");
+    }
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);    
+};
+
+void Renderer::render() {
+    glEnable(GL_DEPTH_TEST);
+    
+    // First pass (light rendering)
+    glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+    glBindFramebuffer(GL_FRAMEBUFFER, this->FBO);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    
+    // Calculate light projection
+    Mat4x4 lightView;
+    Vec3f up = { 0.0f, 1.0f, 0.0f };
+    lightView.set_look_at(lightPos, lightLookPosition, up);
+    
+    Shaders::get().use("lightShader");
+    Shaders::get().find("lightShader")->set_uniform_mat4("u_lightView", lightView);
+    Shaders::get().find("lightShader")->set_uniform_mat4("u_lightProjection", lightProj);
+    
+    level->render(lightView, lightPosition, true);
+    
+    // Second pass (level rendering)
+    glViewport(0, 0, this->windowWidth, this->windowHeight);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    Shaders::get().use("testShader");
+    
+    Shaders::get().find("testShader")->set_uniform_mat4("view", Projection::viewMat);
+    Shaders::get().find("testShader")->set_uniform_mat4("projection", Projection::projMat);
+    
+    Shaders::get().find("testShader")->set_uniform_mat4("lightView", lightView);
+    Shaders::get().find("testShader")->set_uniform_mat4("lightProj", lightProj);
+    Shaders::get().find("testShader")->set_uniform_mat4("lightBias", lightBias);
+    
+    Vec3f vPos = Projection::cameraPosition;
+    Shaders::get().find("testShader")->set_uniform_vec3f("lightPosition", lightPos.x, lightPos.y, lightPos.z);
+    Shaders::get().find("testShader")->set_uniform_vec3f("sourceLightPosition", sourceLightPos.x, sourceLightPos.y, sourceLightPos.z);
+    Shaders::get().find("testShader")->set_uniform_vec3f("viewPosition", vPos.x, vPos.y, vPos.z);
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, this->depthTexture);
+    
+    Shaders::get().find("testShader")->set_uniform_int("shadowmap", 1);
+    
+    glEnable(GL_POLYGON_OFFSET_FILL);		
+    level->render(Projection::viewMat, cameraPosition, false);
+};
+
 class Game
 {
   public:
@@ -2164,6 +2673,8 @@ class Game
 
 class GLCraft : public Game { 
     float time;
+    EffectProcessor *fx;
+    ParticleType *type;
     public:  
        void init() override {
            displayName = "GL Craft";
@@ -2175,11 +2686,31 @@ class GLCraft : public Game {
            
            time = 0.0f;
            
+           Renderer::get().load();
+           
            level = new ChunkCollection();
            player = new Player();
+           fx = new EffectProcessor();
+           type = new ParticleType();
+           
+           type->vertices = {
+               // Positions, texture coordinates
+               MeshVertex({ 0.5, 0.5, 0.0 }, { 1.0, 1.0 }),
+               MeshVertex({ 0.5, -0.5, 0.0 }, { 1.0, 0.0 }),
+               MeshVertex({ -0.5, -0.5, 0.0 }, { 0.0, 0.0 }),
+               
+               MeshVertex({ -0.5, -0.5, 0.0 }, { 0.0, 0.0 }),
+               MeshVertex({ -0.5, 0.5, 0.0 }, { 0.0, 1.0 }),
+               MeshVertex({ 0.5, 0.5, 0.0 }, { 1.0, 1.0 })
+           };
+           type->duration = 1.0f;
+           type->vel = { 0.0f, 5.0f, 0.0f };
+           type->velocitySpread = { 1.0f, 1.0f, 1.0f };
+           
+           type->colorFrom = { 255, 255, 255 };
+           type->colorTo = { 100, 100, 100 };
+           
            UI::load();
-           
-           
        }
        void handle_event(SDL_Event ev, float timeTook) override {
            UI::handle_event(ev);
@@ -2229,6 +2760,12 @@ class GLCraft : public Game {
                        } else {
                            Vec3i dda = player->ray->update_DDA(false);
                            level->set_block(dda.x, dda.y, dda.z, BlockTypes::air);
+                           
+                           Vec3f pos = { float(dda.x + 0.5f), float(dda.y + 0.5f), float(dda.z + 0.5f) };
+                           type->position = pos;
+                           for (int i = 0; i < rand() % 4 + 2; i++) {
+                                fx->emit(type);
+                           }
                        }
                    }
                } 
@@ -2239,6 +2776,7 @@ class GLCraft : public Game {
            time += timeTook;
 
            player->update(timeTook);
+           fx->update(timeTook);
            
            Projection::lookingAt.x = Projection::cameraPosition.x + cos(player->rotationX) * cos(player->rotationY);
            Projection::lookingAt.y = Projection::cameraPosition.y + sin(player->rotationY);
@@ -2246,14 +2784,13 @@ class GLCraft : public Game {
            
            Projection::update();
            
-           Shaders::get().use("testShader");
-        
-           //Shaders::get().find("testShader")->set_uniform_vec3f("lightPosition", player->position.x, player->position.y, player->position.z);
-           Shaders::get().find("testShader")->set_uniform_vec3f("lightPosition", 0.0, 50.0, 0.0);
-           
-           glEnable(GL_DEPTH_TEST);
-           glEnable(GL_POLYGON_OFFSET_FILL);
-           level->render();
+           Renderer::get().sourceLightPos = { 2.0f, 6.0f, 2.0f };
+           Renderer::get().lightPos = { Projection::cameraPosition.x + 100.0f, Projection::cameraPosition.y + 300.0f, Projection::cameraPosition.z + 100.0f };
+           Renderer::get().lightLookPosition = Projection::cameraPosition;
+             
+           // Scene rendering  
+           Renderer::get().render();
+           fx->render();
            
            glDisable(GL_POLYGON_OFFSET_FILL);
            player->render_outline(time);
@@ -2273,6 +2810,7 @@ class GLCraft : public Game {
        void dispose() override {
            Shaders::get().clear();
            level->dispose();
+           fx->dispose();
            UI::dispose();
            player->cleanup();
        }
@@ -2320,7 +2858,7 @@ int main()
     glClearColor(0.4f, 0.5f, 0.9f, 1.0f);
     	
 	glDepthFunc(GL_LESS);
-	glCullFace(GL_FRONT);
+    glCullFace(GL_FRONT);
     glFrontFace(GL_CCW);
     glPolygonOffset(1, 1);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -2350,7 +2888,7 @@ int main()
 		}
 		
 		// Drawing
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		//glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     	
     	// Update and render to screen code
     	game.update(delta);
